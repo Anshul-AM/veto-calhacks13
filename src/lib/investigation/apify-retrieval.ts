@@ -15,7 +15,7 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const RUN_TIMEOUT_MS = 90_000;
 const POLL_INTERVAL_MS = 1_500;
 const MAX_QUERIES = 4;
-const MAX_PAGES = 4;
+const MAX_SOURCES_PER_MODEL = 2;
 
 // Payload fields are intentionally limited to the published Actor schemas:
 // https://apify.com/apify/google-search-scraper/input-schema
@@ -62,6 +62,13 @@ export type SelectedSource = {
   searchSnippet: string;
 };
 
+export type SourcePlan = {
+  candidateId: string;
+  exactModel: string;
+  primary: SelectedSource;
+  fallback: SelectedSource | null;
+};
+
 export type CrawledSource = SelectedSource & {
   finalUrl: string;
   pageTitle: string;
@@ -82,7 +89,7 @@ export type RetrievalResult = {
   diagnostics: InvestigationDiagnostics;
 };
 
-type ActorResult = {
+export type ActorResult = {
   runId: string;
   finalStatus: "SUCCEEDED";
   items: unknown[];
@@ -327,18 +334,31 @@ function researchQueries(
     .slice(0, 2)
     .map((criterion) => boundedModelName(criterion.name).split(" ").slice(0, 3).join(" "))
     .join(" ") || "real world review";
-  return shortlist.flatMap((candidate) => {
+  const byCandidate = shortlist.map((candidate) => {
     const model = boundedModelName(candidate.exactModel);
-    return [
-      { candidate, query: `"${model}" official specifications`, kind: "official" as const },
-      { candidate, query: `"${model}" independent review ${criteria}`, kind: "review" as const },
-    ];
-  }).slice(0, MAX_QUERIES);
+    return {
+      official: { candidate, query: `"${model}" official specifications`, kind: "official" as const },
+      review: { candidate, query: `"${model}" independent review ${criteria}`, kind: "review" as const },
+    };
+  });
+  return [
+    ...byCandidate.map((entry) => entry.official),
+    ...byCandidate.map((entry) => entry.review),
+  ].slice(0, MAX_QUERIES);
 }
 
 const RETAILER_DOMAINS = [
   "amazon.", "walmart.", "target.", "ebay.", "zappos.", "dickssportinggoods.",
-  "rei.com", "runningwarehouse.com", "fleetfeet.com", "roadRunnerSports.com",
+  "rei.com", "runningwarehouse.com", "fleetfeet.com", "roadrunnersports.com",
+];
+
+const BLOCKED_RESELLER_DOMAINS = [
+  "desertcart.", "ubuy.", "aliexpress.", "temu.", "shopstyle.", "shopping.yahoo.",
+];
+
+const REPUTABLE_REVIEW_DOMAINS = [
+  "believeintherun.com", "doctorsofrunning.com", "gearjunkie.com", "outdoorgearlab.com",
+  "roadtrailrun.com", "runrepeat.com", "runnersworld.com", "solereview.com",
 ];
 
 const MANUFACTURER_DOMAINS = new Set([
@@ -353,13 +373,11 @@ function isKnownManufacturerDomain(domain: string): boolean {
   );
 }
 
-function classifySource(domain: string, queryKind: "official" | "review"): EvidenceSourceType {
+function classifySource(domain: string): EvidenceSourceType {
   const lower = domain.toLowerCase();
   if (lower === "reddit.com" || lower.endsWith(".reddit.com")) return "community";
   if (RETAILER_DOMAINS.some((item) => lower.includes(item.toLowerCase()))) return "retailer";
-  if (queryKind === "official" && isKnownManufacturerDomain(lower)) {
-    return "manufacturer";
-  }
+  if (isKnownManufacturerDomain(lower)) return "manufacturer";
   return "independent";
 }
 
@@ -377,11 +395,77 @@ function cleanPageContent(value: unknown): string {
     .slice(0, 24_000);
 }
 
-function selectSources(
+const MODEL_GENERIC_WORDS = new Set([
+  "adult", "black", "blue", "color", "colour", "gray", "grey", "men", "mens", "navy",
+  "red", "road", "running", "shoe", "shoes", "size", "sneaker", "sneakers", "unisex",
+  "walking", "white", "wide", "women", "womens",
+]);
+
+function modelIdentityTerms(model: string): string[] {
+  return model
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length >= 2 && !MODEL_GENERIC_WORDS.has(word))
+    .filter((word, index, all) => all.indexOf(word) === index)
+    .slice(0, 8);
+}
+
+function refersToExactModel(result: OrganicResult, exactModel: string): boolean {
+  const title = cleanText(result.title, 400);
+  const url = safePublicUrl(result.url);
+  let pathname = "";
+  if (url) {
+    try {
+      pathname = decodeURIComponent(new URL(url).pathname);
+    } catch {
+      pathname = new URL(url).pathname;
+    }
+  }
+  const haystack = `${title} ${pathname}`.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  const compact = haystack.replace(/\s+/g, "");
+  const identity = modelIdentityTerms(exactModel);
+  if (identity.length === 0) return false;
+  const required = identity.slice(0, Math.min(3, identity.length));
+  const versionTerms = identity.filter((term) => /\d/.test(term));
+  return [...new Set([...required, ...versionTerms])].every(
+    (term) => haystack.split(/\s+/).includes(term) || compact.includes(term),
+  );
+}
+
+function isBlockedReseller(domain: string): boolean {
+  const lower = domain.toLowerCase();
+  return BLOCKED_RESELLER_DOMAINS.some((item) => lower.includes(item));
+}
+
+function looksLikeIndependentReview(result: OrganicResult, domain: string): boolean {
+  if (REPUTABLE_REVIEW_DOMAINS.some((item) => domain === item || domain.endsWith(`.${item}`))) {
+    return true;
+  }
+  const context = `${cleanText(result.title, 300)} ${safePublicUrl(result.url) ?? ""}`;
+  return /\b(review|reviewed|test|tested|wear test|road test|first look)\b/i.test(context);
+}
+
+function sourceScore(
+  sourceType: EvidenceSourceType,
+  queryKind: "official" | "review",
+  result: OrganicResult,
+  domain: string,
+  resultIndex: number,
+): number {
+  let score = Math.max(0, 20 - resultIndex);
+  if (sourceType === "manufacturer") score += 100;
+  if (sourceType === "independent" && looksLikeIndependentReview(result, domain)) score += 80;
+  if (queryKind === "review" && sourceType === "independent") score += 20;
+  if (queryKind === "official" && sourceType === "manufacturer") score += 20;
+  return score;
+}
+
+export function selectSourcePlans(
   items: unknown[],
   queries: ReturnType<typeof researchQueries>,
   diagnostics: InvestigationDiagnostics["search"],
-): SelectedSource[] {
+): SourcePlan[] {
   const rows = items
     .filter((item): item is SearchDatasetItem => typeof item === "object" && item !== null)
     .map((row) => ({
@@ -407,44 +491,34 @@ function selectSources(
     0,
   );
 
-  const selected: SelectedSource[] = [];
-  const seenUrls = new Set<string>();
+  const candidates = new Map<string, Array<{ source: SelectedSource; score: number }>>();
   for (const [queryIndex, query] of queries.entries()) {
     const normalizedQuery = query.query.replace(/\s+/g, " ").trim().toLowerCase();
     const exactRow = rows.find(
       (row) => row.term.replace(/\s+/g, " ").trim().toLowerCase() === normalizedQuery,
     );
     const pool = exactRow?.results.length ? exactRow.results : (rows[queryIndex]?.results ?? []);
-    const orderedPool = [...pool].sort((a, b) => {
-      const preferred = (value: unknown) => {
-        const url = safePublicUrl(value);
-        if (!url) return 9;
-        const type = classifySource(domainForUrl(url), query.kind);
-        if (type === "community") return 8;
-        if (query.kind === "official") {
-          return type === "manufacturer" ? 0 : type === "independent" ? 1 : 2;
-        }
-        return type === "independent" ? 0 : type === "retailer" ? 1 : 2;
-      };
-      return preferred(a.url) - preferred(b.url);
-    });
-    for (const result of orderedPool) {
+    for (const [resultIndex, result] of pool.entries()) {
       const inspected = inspectPublicUrl(result.url);
       if (inspected.reason !== null) {
         increment(diagnostics.rejectedUrlCounts, inspected.reason);
         continue;
       }
       const url = inspected.url;
-      if (seenUrls.has(url)) {
-        increment(diagnostics.rejectedUrlCounts, "duplicate_url");
-        continue;
-      }
       const domain = domainForUrl(url);
       if (domain.includes("google.") || domain === "google.com") {
         increment(diagnostics.rejectedUrlCounts, "google_result_url");
         continue;
       }
-      const sourceType = classifySource(domain, query.kind);
+      if (isBlockedReseller(domain)) {
+        increment(diagnostics.rejectedUrlCounts, "reseller_mirror");
+        continue;
+      }
+      if (!refersToExactModel(result, query.candidate.exactModel)) {
+        increment(diagnostics.rejectedUrlCounts, "model_mismatch");
+        continue;
+      }
+      const sourceType = classifySource(domain);
       if (sourceType === "community") {
         increment(diagnostics.rejectedUrlCounts, "community_deferred");
         continue;
@@ -453,7 +527,19 @@ function selectSources(
         increment(diagnostics.rejectedUrlCounts, "manufacturer_in_review_slot");
         continue;
       }
-      selected.push({
+      if (query.kind === "review" && sourceType === "retailer") {
+        increment(diagnostics.rejectedUrlCounts, "retailer_not_independent_review");
+        continue;
+      }
+      if (
+        sourceType === "independent" &&
+        !looksLikeIndependentReview(result, domain) &&
+        /\b(shop|shopping|buy|price|coupon|deal|sale)\b/i.test(`${cleanText(result.title, 300)} ${url}`)
+      ) {
+        increment(diagnostics.rejectedUrlCounts, "generic_shopping_listing");
+        continue;
+      }
+      const source: SelectedSource = {
         candidateId: query.candidate.candidateId,
         exactModel: query.candidate.exactModel,
         query: query.query,
@@ -462,14 +548,41 @@ function selectSources(
         domain,
         sourceType,
         searchSnippet: cleanText(result.description ?? result.snippet, 500),
-      });
-      seenUrls.add(url);
-      break;
+      };
+      const list = candidates.get(source.candidateId) ?? [];
+      const existing = list.find((entry) => entry.source.url === url);
+      const score = sourceScore(sourceType, query.kind, result, domain, resultIndex);
+      if (!existing) list.push({ source, score });
+      else if (score > existing.score) {
+        existing.source = source;
+        existing.score = score;
+      }
+      candidates.set(source.candidateId, list);
     }
-    if (selected.length === MAX_PAGES) break;
   }
-  diagnostics.selectedSourceCount = selected.length;
-  return selected;
+
+  const plans: SourcePlan[] = [];
+  for (const query of queries) {
+    if (plans.some((plan) => plan.candidateId === query.candidate.candidateId)) continue;
+    const ranked = (candidates.get(query.candidate.candidateId) ?? [])
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.source);
+    if (ranked.length === 0) continue;
+    const primary = ranked[0];
+    const differentDomain = ranked.find((source) => source.domain !== primary.domain);
+    const fallback = differentDomain ?? ranked[1] ?? null;
+    plans.push({
+      candidateId: query.candidate.candidateId,
+      exactModel: query.candidate.exactModel,
+      primary,
+      fallback,
+    });
+  }
+  diagnostics.selectedSourceCount = plans.reduce(
+    (total, plan) => total + Math.min(MAX_SOURCES_PER_MODEL, plan.fallback ? 2 : 1),
+    0,
+  );
+  return plans;
 }
 
 function readNestedString(value: unknown, path: string[]): string {
@@ -490,11 +603,12 @@ function readNestedNumber(value: unknown, path: string[]): number | null {
   return typeof current === "number" && Number.isFinite(current) ? current : null;
 }
 
-function normalizeRagResult(
+export function normalizeRagResult(
   items: unknown[],
   source: SelectedSource,
   diagnostics: InvestigationDiagnostics["crawl"],
 ): CrawledSource | null {
+  if (items.length === 0) increment(diagnostics.rejectedPageCounts, "empty_rag_dataset");
   for (const item of items) {
     if (typeof item !== "object" || item === null) {
       increment(diagnostics.rejectedPageCounts, "invalid_dataset_item");
@@ -504,6 +618,22 @@ function normalizeRagResult(
     const httpStatus = readNestedNumber(row, ["crawl", "httpStatusCode"]);
     if (httpStatus !== null && (httpStatus < 200 || httpStatus >= 400)) {
       increment(diagnostics.rejectedPageCounts, `http_status_${Math.trunc(httpStatus)}`);
+      continue;
+    }
+    const requestStatus = readNestedString(row, ["crawl", "requestStatus"]);
+    if (requestStatus && requestStatus.toLowerCase() !== "handled") {
+      increment(
+        diagnostics.rejectedPageCounts,
+        `request_status_${requestStatus.replace(/[^a-z0-9_-]/gi, "_").toLowerCase().slice(0, 40)}`,
+      );
+      continue;
+    }
+    const hasPageError =
+      (row.errorMessage !== undefined && row.errorMessage !== null) ||
+      (row.error !== undefined && row.error !== null) ||
+      Boolean(readNestedString(row, ["crawl", "errorMessage"]));
+    if (hasPageError) {
+      increment(diagnostics.rejectedPageCounts, "page_error_record");
       continue;
     }
     const finalInspection = inspectPublicUrl(
@@ -552,6 +682,44 @@ function normalizeRagResult(
     };
   }
   return null;
+}
+
+export async function fetchSourcePlan(
+  plan: SourcePlan,
+  fetchPage: (source: SelectedSource, attempt: 0 | 1) => Promise<ActorResult>,
+  diagnostics: InvestigationDiagnostics["crawl"],
+): Promise<{
+  source: CrawledSource | null;
+  runIds: string[];
+  actorFailures: number;
+  pageFailures: number;
+}> {
+  const runIds: string[] = [];
+  let actorFailures = 0;
+  let pageFailures = 0;
+  const attempts = [plan.primary, plan.fallback].filter(
+    (source): source is SelectedSource => source !== null,
+  ).slice(0, MAX_SOURCES_PER_MODEL);
+
+  for (const [index, source] of attempts.entries()) {
+    try {
+      const run = await fetchPage(source, index as 0 | 1);
+      runIds.push(run.runId);
+      diagnostics.datasetItemCount += run.items.length;
+      const parsed = normalizeRagResult(run.items, source, diagnostics);
+      if (parsed) return { source: parsed, runIds, actorFailures, pageFailures };
+      pageFailures += 1;
+    } catch (error) {
+      actorFailures += 1;
+      if (error instanceof EvidenceProviderError && error.runId) runIds.push(error.runId);
+      increment(
+        diagnostics.rejectedPageCounts,
+        error instanceof EvidenceProviderError ? error.code.toLowerCase() : "rag_fetch_failed",
+      );
+    }
+  }
+
+  return { source: null, runIds, actorFailures, pageFailures };
 }
 
 export async function retrieveEvidenceSources(
@@ -628,7 +796,8 @@ export async function retrieveEvidenceSources(
     return finish("failed");
   }
 
-  const selected = selectSources(searchItems, queries, diagnostics.search);
+  const plans = selectSourcePlans(searchItems, queries, diagnostics.search);
+  const selected = plans.flatMap((plan) => [plan.primary, ...(plan.fallback ? [plan.fallback] : [])]);
   searchContexts = selected.map((source) => ({
     candidateId: source.candidateId,
     exactModel: source.exactModel,
@@ -665,9 +834,10 @@ export async function retrieveEvidenceSources(
     });
   }
 
-  const fetches = await Promise.allSettled(
-    selected.slice(0, MAX_PAGES).map(async (source) => {
-      const run = await runActor(
+  const fetches = await Promise.all(
+    plans.map((plan) => fetchSourcePlan(
+      plan,
+      (source) => runActor(
         RAG_WEB_BROWSER_ACTOR,
         {
           query: source.url,
@@ -680,42 +850,38 @@ export async function retrieveEvidenceSources(
           debugMode: false,
         },
         token,
-      );
-      return { source, run };
-    }),
+      ),
+      diagnostics.crawl,
+    )),
   );
 
   diagnostics.crawl.launched = fetches.length > 0;
-  const sources: CrawledSource[] = [];
-  let failedRuns = 0;
-  for (const fetchResult of fetches) {
-    if (fetchResult.status === "rejected") {
-      failedRuns += 1;
-      const error = fetchResult.reason;
-      if (error instanceof EvidenceProviderError && error.runId) {
-        ragWebBrowserRunIds.push(error.runId);
-      }
-      increment(
-        diagnostics.crawl.rejectedPageCounts,
-        error instanceof EvidenceProviderError ? error.code.toLowerCase() : "rag_fetch_failed",
-      );
-      continue;
-    }
+  const sources = fetches.flatMap((result) => result.source ? [result.source] : []);
+  const failedRuns = fetches.reduce((total, result) => total + result.actorFailures, 0);
+  const failedPages = fetches.reduce((total, result) => total + result.pageFailures, 0);
+  ragWebBrowserRunIds.push(...fetches.flatMap((result) => result.runIds));
 
-    const { source, run } = fetchResult.value;
-    ragWebBrowserRunIds.push(run.runId);
-    diagnostics.crawl.datasetItemCount += run.items.length;
-    const parsed = normalizeRagResult(run.items, source, diagnostics.crawl);
-    if (parsed) sources.push(parsed);
-  }
-
-  diagnostics.crawl.finalStatus =
-    failedRuns === 0 ? "SUCCEEDED" : sources.length > 0 ? "PARTIAL" : "FAILED";
+  diagnostics.crawl.finalStatus = sources.length === plans.length
+    ? failedRuns + failedPages > 0 ? "SUCCEEDED_AFTER_FALLBACK" : "SUCCEEDED"
+    : sources.length > 0
+      ? "PARTIAL"
+      : failedPages > 0
+        ? "PAGE_FETCH_FAILED"
+        : "FAILED";
   if (failedRuns > 0) {
     issues.push({
       stage: "crawl",
       code: sources.length > 0 ? "PARTIAL_RAG_FETCH" : "RAG_FETCH_FAILED",
-      message: `${failedRuns} of ${fetches.length} bounded page fetches failed or timed out.`,
+      message: `${failedRuns} bounded RAG Web Browser Actor run${failedRuns === 1 ? "" : "s"} failed or timed out.`,
+    });
+  }
+  if (failedPages > 0) {
+    issues.push({
+      stage: "crawl",
+      code: sources.length > 0 ? "PAGE_FETCH_FALLBACK_USED" : "PAGE_FETCH_FAILED",
+      message: sources.length > 0
+        ? `${failedPages} target page fetch${failedPages === 1 ? "" : "es"} failed inside successful Actor runs; VETO continued with a bounded alternate source already found by Google Search.`
+        : `${failedPages} target page fetch${failedPages === 1 ? "" : "es"} failed inside successful Actor runs, including the bounded alternate sources.`,
     });
   }
   if (sources.length === 0) {
@@ -730,13 +896,13 @@ export async function retrieveEvidenceSources(
           ? "The bounded page fetches returned no dataset rows."
           : "Page fetches returned rows, but none contained safe same-domain Markdown for the exact selected source.",
     });
-    return finish(failedRuns === fetches.length ? "failed" : "no_evidence");
+    return finish(failedRuns + failedPages > 0 ? "failed" : "no_evidence");
   }
-  if (sources.length < selected.length) {
+  if (sources.length < plans.length) {
     issues.push({
       stage: "crawl",
       code: "PARTIAL_RAG_COVERAGE",
-      message: `${sources.length} of ${selected.length} selected public pages yielded usable same-domain Markdown.`,
+      message: `${sources.length} of ${plans.length} shortlisted models yielded usable same-domain Markdown.`,
     });
   }
   return finish("completed", sources);

@@ -1,8 +1,49 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectPublicUrl } from "../src/lib/investigation/url-safety.ts";
-import { buildEvidenceRecords } from "../src/lib/investigation/evidence.ts";
-import { deriveEvidenceStatus } from "../src/lib/investigation/status.ts";
+import { existsSync } from "node:fs";
+import { registerHooks } from "node:module";
+import { fileURLToPath } from "node:url";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    try {
+      return nextResolve(specifier, context);
+    } catch (error) {
+      if (specifier.startsWith(".") && context.parentURL) {
+        const candidate = new URL(`${specifier}.ts`, context.parentURL);
+        if (existsSync(fileURLToPath(candidate))) return { url: candidate.href, shortCircuit: true };
+      }
+      throw error;
+    }
+  },
+});
+
+const { inspectPublicUrl } = await import("../src/lib/investigation/url-safety.ts");
+const { buildEvidenceRecords } = await import("../src/lib/investigation/evidence.ts");
+const { deriveEvidenceStatus } = await import("../src/lib/investigation/status.ts");
+const { fetchSourcePlan, selectSourcePlans } = await import(
+  "../src/lib/investigation/apify-retrieval.ts"
+);
+
+const searchDiagnostics = () => ({
+  launched: true,
+  finalStatus: "SUCCEEDED",
+  datasetItemCount: 0,
+  errorRowCount: 0,
+  organicResultCount: 0,
+  candidateUrlCount: 0,
+  selectedSourceCount: 0,
+  rejectedUrlCounts: {},
+});
+
+const crawlDiagnostics = () => ({
+  launched: true,
+  finalStatus: null,
+  datasetItemCount: 0,
+  pagesWithContent: 0,
+  parsedPageCount: 0,
+  rejectedPageCounts: {},
+});
 
 test("public URL inspection keeps explicit sanitized rejection categories", () => {
   assert.equal(inspectPublicUrl("http://localhost:3000").reason, "private_or_local_host");
@@ -105,4 +146,96 @@ test("evidence passages reject a related but different model", () => {
   const result = buildEvidenceRecords(sources, framework);
   assert.equal(result.records.length, 0);
   assert.equal(result.diagnostics.relevantPassageCount, 0);
+});
+
+test("source selection rejects mirrors, unrelated models, and retailer review listings", () => {
+  const candidate = { candidateId: "cand_reebok", exactModel: "Reebok DMX Comfort+" };
+  const officialQuery = `"Reebok DMX Comfort+" official specifications`;
+  const reviewQuery = `"Reebok DMX Comfort+" independent review cushioning`;
+  const queries = [
+    { candidate, query: officialQuery, kind: "official" },
+    { candidate, query: reviewQuery, kind: "review" },
+  ];
+  const diagnostics = searchDiagnostics();
+  const items = [
+    {
+      searchQuery: { term: officialQuery },
+      organicResults: [
+        { title: "Reebok DMX Comfort+", url: "https://www.desertcart.example/reebok-dmx-comfort-plus" },
+        { title: "Reebok DMX walking shoe", url: "https://www.reebok.com/us-en/p/dmx-walking" },
+        { title: "Reebok DMX Comfort+", url: "https://www.reebok.com/us-en/p/dmx-comfort-plus" },
+      ],
+    },
+    {
+      searchQuery: { term: reviewQuery },
+      organicResults: [
+        { title: "Buy Reebok DMX Comfort+", url: "https://www.amazon.com/reebok-dmx-comfort-plus" },
+        { title: "Reebok DMX Comfort+ Review", url: "https://runrepeat.com/reebok-dmx-comfort-plus" },
+      ],
+    },
+  ];
+
+  const plans = selectSourcePlans(items, queries, diagnostics);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0].primary.domain, "reebok.com");
+  assert.equal(plans[0].fallback.domain, "runrepeat.com");
+  assert.equal(diagnostics.rejectedUrlCounts.reseller_mirror, 1);
+  assert.equal(diagnostics.rejectedUrlCounts.model_mismatch, 1);
+  assert.equal(diagnostics.rejectedUrlCounts.retailer_not_independent_review, 1);
+});
+
+test("a successful Actor run with an HTTP 500 page uses one bounded fallback URL", async () => {
+  const primary = {
+    candidateId: "cand_test",
+    exactModel: "Nike Pegasus 41",
+    query: "Nike Pegasus 41 official specifications",
+    title: "Nike Pegasus 41",
+    url: "https://www.nike.com/pegasus-41",
+    domain: "nike.com",
+    sourceType: "manufacturer",
+    searchSnippet: "",
+  };
+  const fallback = {
+    ...primary,
+    query: "Nike Pegasus 41 independent review",
+    title: "Nike Pegasus 41 Review",
+    url: "https://runrepeat.com/nike-pegasus-41",
+    domain: "runrepeat.com",
+    sourceType: "independent",
+  };
+  const calls = [];
+  const diagnostics = crawlDiagnostics();
+  const result = await fetchSourcePlan(
+    { candidateId: primary.candidateId, exactModel: primary.exactModel, primary, fallback },
+    async (source) => {
+      calls.push(source.url);
+      if (source.url === primary.url) {
+        return {
+          runId: "run_primary",
+          finalStatus: "SUCCEEDED",
+          items: [{
+            crawl: { httpStatusCode: 500, httpStatusMessage: "Internal Server Error", requestStatus: "handled" },
+            metadata: { url: primary.url, title: primary.title },
+          }],
+        };
+      }
+      return {
+        runId: "run_fallback",
+        finalStatus: "SUCCEEDED",
+        items: [{
+          crawl: { httpStatusCode: 200, httpStatusMessage: "OK", requestStatus: "handled", loadedAt: "2026-10-25T00:00:00.000Z" },
+          metadata: { url: fallback.url, title: fallback.title },
+          markdown: "Nike Pegasus 41 Review. The cushioning is intended for daily road running.",
+        }],
+      };
+    },
+    diagnostics,
+  );
+
+  assert.deepEqual(calls, [primary.url, fallback.url]);
+  assert.equal(result.source?.finalUrl, fallback.url);
+  assert.deepEqual(result.runIds, ["run_primary", "run_fallback"]);
+  assert.equal(result.pageFailures, 1);
+  assert.equal(diagnostics.rejectedPageCounts.http_status_500, 1);
+  assert.equal(diagnostics.parsedPageCount, 1);
 });
